@@ -8,6 +8,8 @@
 #include <sstream> //this header file is needed when using stringstream
 #include <fstream>
 #include <string>
+#include <cstring>
+#include "plib.h"
 
 #define MNIST_TESTING_SET_IMAGE_FILE_NAME "data/t10k-images-idx3-ubyte"  ///< MNIST image testing file in the data folder
 #define MNIST_TESTING_SET_LABEL_FILE_NAME "data/t10k-labels-idx1-ubyte"  ///< MNIST label testing file in the data folder
@@ -18,12 +20,13 @@
 #define OUTPUT_BIASES_FILE "net_params/out_biases.txt"
 
 #define NUMBER_OF_INPUT_CELLS 784   ///< use 28*28 input cells (= number of pixels per MNIST image)
-#define NUMBER_OF_HIDDEN_CELLS 256   ///< use 256 hidden cells in one hidden layer
 #define NUMBER_OF_OUTPUT_CELLS 10   ///< use 10 output cells to model 10 digits (0-9)
 
 #define MNIST_MAX_TESTING_IMAGES 10000                      ///< number of images+labels in the TEST file/s
 #define MNIST_IMG_WIDTH 28                                  ///< image width in pixel
 #define MNIST_IMG_HEIGHT 28                                 ///< image height in pixel
+
+#define MNIST_LABEL_BUFFER_SIZE 4
 
 using namespace std;
 
@@ -94,6 +97,13 @@ struct MNIST_LabelFileHeader{
     uint32_t magicNumber;
     uint32_t maxImages;
 };
+
+FILE *imageFile, *labelFile;
+MNIST_Image img;
+MNIST_Label lbl[MNIST_LABEL_BUFFER_SIZE];
+// number of incorrect predictions
+int errCount = 0;
+int ht_count;
 
 /**
  * @details Set cursor position to given coordinates in the terminal window
@@ -252,7 +262,7 @@ void readLabelFileHeader(FILE *imageFile, MNIST_LabelFileHeader *lfh){
  * is moved to the position of the 1st IMAGE
  */
 
-FILE *openMNISTImageFile(char *fileName){
+FILE *openMNISTImageFile(const char *fileName){
 
     FILE *imageFile;
     imageFile = fopen (fileName, "rb");
@@ -274,7 +284,7 @@ FILE *openMNISTImageFile(char *fileName){
  * is moved to the position of the 1st LABEL
  */
 
-FILE *openMNISTLabelFile(char *fileName){
+FILE *openMNISTLabelFile(const char *fileName){
 
     FILE *labelFile;
     labelFile = fopen (fileName, "rb");
@@ -403,70 +413,90 @@ int getNNPrediction(){
 
 }
 
+void *calc_input_nodes(void *args){
+    for (int imgCount=0; imgCount<MNIST_MAX_TESTING_IMAGES; imgCount++){
+        wait_input_thread();
+
+        // Reading next image and corresponding label
+        img = getImage(imageFile);
+        lbl[imgCount%MNIST_LABEL_BUFFER_SIZE] = getLabel(labelFile);
+        input_thread_finished();
+    }
+    return NULL;
+}
+
+void *calc_hidden_nodes(void *args){
+    int index,begin,end;
+    get_hidden_node_id(index,begin,end);
+    for (int imgCount=0; imgCount<MNIST_MAX_TESTING_IMAGES; imgCount++){
+        wait_hidden_thread(index);
+        for (int j = begin; j < end; j++) {
+            hidden_nodes[j].output = 0;
+            for (int z = 0; z < NUMBER_OF_INPUT_CELLS; z++) {
+                hidden_nodes[j].output += img.pixel[z] * hidden_nodes[j].weights[z];
+            }
+            hidden_nodes[j].output += hidden_nodes[j].bias;
+            hidden_nodes[j].output = (hidden_nodes[j].output >= 0) ?  hidden_nodes[j].output : 0;
+        }
+        hidden_thread_finished();
+    }
+    return NULL;
+}
+
+void *calc_output_nodes(void *args){
+    int index;
+    index = get_output_node_id();
+    for (int imgCount=0; imgCount<MNIST_MAX_TESTING_IMAGES; imgCount++){
+        wait_output_thread(index);
+        output_nodes[index].output = 0;
+        for (int j = 0; j < NUMBER_OF_HIDDEN_CELLS; j++){
+            output_nodes[index].output += hidden_nodes[j].output * output_nodes[index].weights[j];
+        }
+        output_nodes[index].output += 1/(1+ exp(-1* output_nodes[index].output));
+        if(output_thread_finished()){
+            int predictedNum = getNNPrediction();
+            continue_hidden_threads2();
+            // display progress
+            displayLoadingProgressTesting(imgCount,5,5);
+            displayImage(&img, 8,6);
+
+            if (predictedNum!=lbl[imgCount%MNIST_LABEL_BUFFER_SIZE]) errCount++;
+
+            printf("\n      Prediction: %d   Actual: %d ",predictedNum, lbl[imgCount%MNIST_LABEL_BUFFER_SIZE]);
+
+            displayProgress(imgCount, errCount, 5, 66);
+        }
+    }
+    return NULL;
+}
 /**
  * @details test the neural networks to obtain its accuracy when classifying
  * 10k images.
  */
-
 void testNN(){
-        // open MNIST files
-    FILE *imageFile, *labelFile;
+    pthread_t t;
+    // open MNIST files
     imageFile = openMNISTImageFile(MNIST_TESTING_SET_IMAGE_FILE_NAME);
     labelFile = openMNISTLabelFile(MNIST_TESTING_SET_LABEL_FILE_NAME);
 
-
     // screen output for monitoring progress
     displayImageFrame(7,5);
-
-    // number of incorrect predictions
-    int errCount = 0;
-
-
-    // Loop through all images in the file
-    for (int imgCount=0; imgCount<MNIST_MAX_TESTING_IMAGES; imgCount++){
-        // display progress
-        displayLoadingProgressTesting(imgCount,5,5);
-
-        // Reading next image and corresponding label
-        MNIST_Image img = getImage(imageFile);
-        MNIST_Label lbl = getLabel(labelFile);
-
-        displayImage(&img, 8,6);
-
-        // loop through all output cells for the given image
-        for (int i= 0; i < NUMBER_OF_OUTPUT_CELLS; i++){
-            output_nodes[i].output = 0;
-            for (int j = 0; j < NUMBER_OF_HIDDEN_CELLS; j++) {
-                hidden_nodes[j].output = 0;
-                for (int z = 0; z < NUMBER_OF_INPUT_CELLS; z++) {
-                    hidden_nodes[j].output += img.pixel[z] * hidden_nodes[j].weights[z];
-                }
-                hidden_nodes[j].output += hidden_nodes[j].bias;
-                hidden_nodes[j].output = (hidden_nodes[j].output >= 0) ?  hidden_nodes[j].output : 0;
-                output_nodes[i].output += hidden_nodes[j].output * output_nodes[i].weights[j];
-            }
-            output_nodes[i].output += 1/(1+ exp(-1* output_nodes[i].output));
-        }
-
-        int predictedNum = getNNPrediction();
-        if (predictedNum!=lbl) errCount++;
-
-        printf("\n      Prediction: %d   Actual: %d ",predictedNum, lbl);
-
-        displayProgress(imgCount, errCount, 5, 66);
-
-    }
-
+    run_threads(1,calc_input_nodes);
+    run_threads(ht_count,calc_hidden_nodes);
+    run_threads(OUTPUT_THREADS_COUNT,calc_output_nodes);
+    join_all();
     // Close files
     fclose(imageFile);
     fclose(labelFile);
 
 }
 int main(int argc, const char * argv[]) {
-
+    printf("Please input the number of hidden threads\n");
+    scanf("%d",&ht_count );
+    set_hidden_threads_count(ht_count);
     // remember the time in order to calculate processing time at the end
     time_t startTime = time(NULL);
-
+    init_semaphores();
     // clear screen of terminal window
     clearScreen();
     printf("    MNIST-NN: a simple 2-layer neural network processing the MNIST handwriting images\n");
@@ -484,6 +514,6 @@ int main(int argc, const char * argv[]) {
     time_t endTime = time(NULL);
     double executionTime = difftime(endTime, startTime);
     printf("\n    DONE! Total execution time: %.1f sec\n\n",executionTime);
-
+    close_semaphores();
     return 0;
 }
